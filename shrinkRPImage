@@ -1,0 +1,429 @@
+#!/usr/bin/python3
+#
+# shrinkRPImage - shrink an image of a Raspberry PI SD card into something more compact
+#                 This is good for storage and reducing copy time.
+#
+# One common way of backing up a PI you've programmed is to copy the SD card.  The
+# copy/backup is, of course, going to be as large as your SD card, yet it is very
+# likely that most of the card is empty.  This program uses resize2fs to shrink the
+# root file system to its smallest size and then shrinks the partion to match it
+# thus allowing for the file to be truncated.
+#
+# This image created, when copied back to a SD card will be "expandd" on the next
+# boot to fill the size of the new card.
+#
+import os
+import re
+import subprocess
+import sys
+import time
+# regular expression patterns to look for
+sectorSizePattern = re.compile(r'Units: sectors of 1 \* 512 = 512 bytes')
+partition1Pattern = re.compile(r'img1\s+(\d+)')
+partition2Pattern = re.compile(r'img2\s+(\d+)')
+partition3Pattern = re.compile(r'img3\s+(\d+)')
+loop0Pattern = re.compile(r'/dev/loop0')
+loop0p2Pattern = re.compile(r'/dev/loop0p2 : start=\s+\d+, size=\s+\d+, type=83')
+loop0p2EndSectorPattern = re.compile(r'/dev/loop0p2\s+\d+\s+(\d+)')
+blocksUsedPattern = re.compile(r'rootfs: [^,]+, (\d+)\/(\d+) blocks')
+newPartitionSizePattern = re.compile(r'The filesystem on /dev/loop0 is now (\d+)')
+alreadySizePattern = re.compile(r'The filesystem is already (\d+)')
+rootPartitionLocationPattern = re.compile(r'root=PARTUUID=[^\s]+')
+labelIdPattern = re.compile(r'Disk identifier: 0x([^\s]+)')
+fstabBootPattern = re.compile(r'(PARTUUID=[^\s]+)\s+/boot')
+fstabRootPattern = re.compile(r'(PARTUUID=[^\s]+)\s+/\s')
+# persistent variables
+foundSectorSize = False
+foundPartition1 = False
+foundPartition2 = False
+partition1Offset = 0
+partition2Offset = 0
+partition2Sector = 0
+RETRY_LIMIT = 3
+# the following file comes from Raspbian Buster 2020-05-27-raspios-buster-lite-armf.zip
+RESIZE2FS_ONCE = ("" +
+                 "#!/bin/sh\n" +
+                 "### BEGIN INIT INFO\n" +
+                 "# Provides:          resize2fs_once\n" +
+                 "# Required-Start:\n" +
+                 "# Required-Stop:\n" +
+                 "# Default-Start: 3\n" +
+                 "# Default-Stop:\n" +
+                 "# Short-Description: Resize the root filesystem to fill partition\n" +
+                 "# Description:\n" +
+                 "### END INIT INFO\n" +
+                 ". /lib/lsb/init-functions\n" +
+                 "case \"$1\" in\n" +
+                 "  start)\n" +
+                 "    log_daemon_msg \"Starting resize2fs_once\"\n" +
+                 "    ROOT_DEV=$(findmnt / -o source -n) &&\n" +
+                 "    resize2fs $ROOT_DEV &&\n" +
+                 "    update-rc.d resize2fs_once remove &&\n" +
+                 "    rm /etc/init.d/resize2fs_once &&\n" +
+                 "    log_end_msg $?\n" +
+                 "    ;;\n" +
+                 "  *)\n" +
+                 "    echo \"Usage: $0 start\" >&2\n" +
+                 "    exit 3\n" +
+                 "    ;;\n" +
+                 "esac\n")
+
+def protectedCommandLine(command):
+    ok = False
+    retry = True
+    count = 0
+    result = ""
+    while retry:
+        try:
+            result = subprocess.check_output(command, shell=True).decode("utf-8")
+            ok = True
+            retry = False
+        except subprocess.CalledProcessError as err:
+            text = err.output.decode("utf-8")
+            if "File exists" in text and "ln: failed" in text:
+                retry = False
+                ok = True
+            elif "Resource" in text or "losetup" in text:
+                time.sleep( 2 * count )
+                count += 1
+                if count > RETRY_LIMIT:
+                    retry = False
+                    print("command returned error code:", err)
+            else:
+                retry = False
+                print("command returned error code:", err)
+        except FileNotFoundError as err:
+            text = err.output.decode("utf-8")
+            if "/dev/loop0" in text:
+                time.sleep( 2 * count )
+                count += 1
+                if count > RETRY_LIMIT:
+                    retry = False
+                    print("command returned error code:", err)
+            else:
+                retry = False
+                print("command returned error code:", err)
+
+    if not ok:
+        print("terminating without changing loop device or mount state - check with losetup -l and ls /mnt")
+        exit(1)
+
+    if count > 0:
+        print("info: while executing command,", command, ", had to retry", count, "times")
+
+    return result
+
+if len(sys.argv) != 2:
+    print("usage: shrinkRPImage <file name>")
+    exit(1)
+
+# First step, check the image file to make sure it is what we expect.  If it isn't
+# we will exit
+result = protectedCommandLine("fdisk -l " + sys.argv[1] + " 2>&1")
+for line in result.split("\n"):
+    found = sectorSizePattern.search(line)
+    if found:
+        foundSectorSize = True
+    found = partition1Pattern.search(line)
+    if found:
+        sector = int(found.group(1))
+        partition1Offset = sector * 512
+        print ("Found partition 1 starting at sector:", sector, ", byte:", sector * 512)
+        if "FAT" in line:
+            foundPartition1 = True
+    found = partition2Pattern.search(line)
+    if found:
+        sector = int(found.group(1))
+        partition2Offset = sector * 512
+        partition2Sector = sector
+        print ("Found partition 2 starting at sector:", sector, ", byte:", partition2Offset)
+        if "Linux" in line:
+            foundPartition2 = True
+    found = partition3Pattern.search(line)
+    if found:
+        print ("Found a partition that can not be handled")
+        print(line)
+        exit(1)
+
+if not foundSectorSize:
+    print("Sector size of 512 bytes not found")
+    exit(1)
+if not foundPartition1:
+    print("Partion 1 was not found or was not FAT")
+    exit(1)
+if not foundPartition2:
+    print("Partion 2 was not found or was not Linux")
+    exit(1)
+
+# Make sure that we won't collide with any other loop devices
+
+result = protectedCommandLine("losetup -l ")
+for line in result.split("\n"):
+    found = loop0Pattern.search(line)
+    if found:
+        print("Error in system state - /dev/loop0 is already in use - resolve this first")
+        exit(1)
+
+# Make sure mount point is free
+
+result = protectedCommandLine("ls -l /mnt 2>&1")
+if not "total 0":
+    print("Expected mount point of /mnt is not free")
+    exit(1)
+
+# Associate a loop device to partition 2 of SD image
+
+ok = False
+result = protectedCommandLine("losetup -f --show  -o " + str(partition2Offset) + " " + sys.argv[1] + " 2>&1")
+for line in result.split("\n"):
+    found = loop0Pattern.search(line)
+    if found:
+        ok = True
+
+if not ok:
+    print("losetup operation failed to associate a loop device to the file")
+    exit(1)
+
+# Check the image, it should be pristine.
+
+ok = False
+result = protectedCommandLine("fsck -fn /dev/loop0 2>&1")
+for line in result.split("\n"):
+    found = blocksUsedPattern.search(line)
+    if found:
+        numberOfBlocksUsed = int(found.group(1))
+        totalNumberOfBlocks = int(found.group(2))
+        ok = True
+
+if not ok:
+    print("fsck of /dev/loop0 failed")
+    exit(1)
+
+numberOfSectorsUsed = numberOfBlocksUsed * 8
+numberOfBytesUsed = numberOfSectorsUsed * 512
+newPartitionSize = 0
+print("The second partition is currently using:", numberOfBlocksUsed, " blocks, which is ", numberOfSectorsUsed, " sectors, or ", numberOfBytesUsed, " bytes");
+
+# Resize the file system in partition 2 its smallest size
+
+ok = False
+result = protectedCommandLine("e2fsck -fy /dev/loop0 2>&1; sleep 10; resize2fs /dev/loop0 -M 2>&1; ")
+for line in result.split("\n"):
+    print(line)
+    found = newPartitionSizePattern.search(line)
+    if found:
+        newPartitionSize = int(found.group(1)) * 8
+        ok = True
+    found = alreadySizePattern.search(line)
+    if found:
+        newPartitionSize = int(found.group(1)) * 8
+        ok = True
+
+if not ok:
+    print("resize2fs failed")
+    exit(1)
+
+print("Setting second disk partion to new size of", newPartitionSize, "sectors")
+
+# Delete the loop device on partition 2
+
+result = protectedCommandLine("losetup -d /dev/loop0")
+
+# Associate a loop device with the image file
+
+result = protectedCommandLine("losetup  --show /dev/loop0 " + sys.argv[1] + " 2>&1")
+for line in result.split("\n"):
+    found = loop0Pattern.search(line)
+    if found:
+        ok = True
+
+if not ok:
+    print("losetup operation failed to associate the expected loop device to the disk")
+    exit(1)
+
+# Get the partition table of the SD image
+
+ok = False
+result = protectedCommandLine("sfdisk --dump /dev/loop0 2>&1 ")
+reformatPartitionControl = ""
+found = loop0p2Pattern.search(result)
+if found:
+    ok = True
+    for line in result.split("\n"):
+        found = loop0p2Pattern.search(line)
+        if found:
+            reformatPartitionControl += "/dev/loop0p2 : start={:12}, size={:12}, type=83\n".format(partition2Sector, newPartitionSize)
+        else:
+            reformatPartitionControl += line + "\n"
+    print("sfdisk will be sent the following information to resize the second partition:")
+    print(reformatPartitionControl)
+if not ok:
+    print("sfdisk operation failed to analyze /dev/loop0 device ")
+    exit(1)
+
+# Reformat the second partition to only be large enough to hold the smaller file system
+
+time.sleep(10)
+sizeOfNewFile = 0
+newPARTUUID = ""
+ok = False
+command = "echo \"{}\" | sfdisk /dev/loop0 2>&1".format(reformatPartitionControl)
+result = protectedCommandLine(command)
+for line in result.split("\n"):
+    print(line)
+    found = labelIdPattern.search(line)
+    if found:
+        newPARTUUID = found.group(1)
+    found = loop0p2EndSectorPattern.search(line)
+    if found:
+        sizeOfNewFile = (int(found.group(1)) + 100) * 512
+        if newPARTUUID != "":
+            ok = True
+
+if not ok:
+    print("sfdisk operation failed to set partition table of /dev/loop0 device ")
+    exit(1)
+
+# Delete the loop device associated with the entire image
+
+result = protectedCommandLine("losetup -d /dev/loop0 2>&1")
+
+# Associate a loop device to the new second partition
+    
+ok = False
+result = protectedCommandLine("losetup -f --show  -o " + str(partition2Offset) + " " + sys.argv[1] + " 2>&1")
+for line in result.split("\n"):
+    found = loop0Pattern.search(line)
+    if found:
+        ok = True
+
+if not ok:
+    print("losetup operation failed to associate a loop device to the file")
+    exit(1)
+
+# Check the file system to confirm it is still prestine.
+
+result = protectedCommandLine("fsck -fn /dev/loop0 2>&1")
+
+# Delete the loop device associated with the second partition
+
+result = protectedCommandLine("losetup -d /dev/loop0 2>&1")
+
+# Chop off the end of the file (after resize and repartition, there is no valid data there)
+
+print("Truncating file to {} bytes".format(sizeOfNewFile))
+command = "sync {}; truncate -s {} {} 2>&1; sync {}".format(sys.argv[1], sizeOfNewFile, sys.argv[1], sys.argv[1])
+result = protectedCommandLine(command)
+
+print("\nFrom all indications, the file {} has been successfully resized".format(sys.argv[1]))
+print("By successful, what is meant is that all the useful data that was originally on the disk\n"
+      "should still be on it, however, until the /boot/cmdline.txt file and /etc/fstab are\n"
+      "modified, this image will not boot automatically.  You can copy this to an SD and use\n"
+      "it as a 'thumb drive', but it won't boot\n")
+
+print("\n\nNow attempting to make changes so that the image will boot and auto resize on the first boot.....")
+
+# Associate a loop device to the first/boot partition
+
+ok = False
+result = protectedCommandLine("losetup /dev/loop0 --show  -o " + str(partition1Offset) + " " + sys.argv[1] + " 2>&1")
+
+# Mount the loop device so we have access to its files
+
+result = protectedCommandLine("mount /dev/loop0 /mnt ")
+
+# Read in the original cmdline.txt file and make a new line
+
+ok = False
+ammendedLine = ""
+patternToChange = ""
+result = protectedCommandLine("cat /mnt/cmdline.txt 2>&1")
+for line in result.split("\n"):
+    if "init=/usr/lib/raspi-config/init_resize.sh" in line:
+        print("cmdline.txt already setup to resize - not really expecting this")
+        ammendedLine = line
+    else:
+        print("ammending cmdline.txt to resize on boot")
+        ammendedLine = line + " init=/usr/lib/raspi-config/init_resize.sh"
+    found = rootPartitionLocationPattern.search(ammendedLine)
+    if found:
+        patternToChange = found.group(0)
+        ammendedLine = ammendedLine.replace(patternToChange, "root=PARTUUID=" + newPARTUUID + "-02")
+        ok = True
+    break  # should only be one line
+if not ok:
+    print("The cmdline.txt file does not appear to be as expected - either it wasn't there, or the location for root was not specified as a PARTUUID")
+    exit(1)
+
+# Write the new cmdline.txt file
+
+command = "echo \"{}\" > /mnt/cmdline.txt".format(ammendedLine)
+result = protectedCommandLine(command)
+
+# Unmount the /boot partition
+
+result = protectedCommandLine("umount /mnt 2>&1")
+
+# Delete the loop device associated with the /boot parttion
+
+result = protectedCommandLine("losetup -d /dev/loop0 2>&1")
+
+# Associate a loop device with the root partion
+
+result = protectedCommandLine("losetup /dev/loop0 --show  -o " + str(partition2Offset) + " " + sys.argv[1] + " 2>&1")
+
+# Mount the root file system so we have access to /etc/fstab
+
+result = protectedCommandLine("mount /dev/loop0 /mnt 2>&1")
+
+# Verify /etc/fstab is setup for two file systems to be mounted and they are referenced by PARTUUID
+
+newFStab = ""
+result = protectedCommandLine("cat /mnt/etc/fstab ")
+ok = False
+for line in result.split("\n"):
+    adjustedLine = line
+    found = fstabBootPattern.search(line)
+    if found:
+        patternToChange = found.group(1)
+        adjustedLine = line.replace(patternToChange, "PARTUUID=" + newPARTUUID + "-01")
+    found = fstabRootPattern.search(line)
+    if found:
+        if patternToChange[0:-2] == found.group(1)[0:-2]:
+            patternToChange = found.group(1)
+            adjustedLine = line.replace(patternToChange, "PARTUUID=" + newPARTUUID + "-02")
+            # fstab is sufficiently consistent to change
+            ok = True
+    newFStab += adjustedLine + "\n"
+if not ok:
+    print("The /etc/fstab file does not appear to be formatted as expected - look at PARTUUIDs")
+    exit(1)
+
+# Write the new partition references to the /etc/fstab file
+
+command = "echo \"{}\" > /mnt/etc/fstab".format(newFStab)
+result = protectedCommandLine(command)
+
+# Add the file resize2fs_once to /etc/init.d/
+
+command = "echo \'{}\' > /mnt/etc/init.d/resize2fs_once".format(RESIZE2FS_ONCE)
+result = protectedCommandLine(command)
+
+# Set execute priviledge
+
+result = protectedCommandLine("chmod 755 /mnt/etc/init.d/resize2fs_once")
+
+# Add link in /etc/rc3.d/ to resize2fs_once
+
+command = "cd /mnt/etc/rc3.d/; ln -s ../init.d/resize2fs_once S01resize2fs_once 2>&1"
+result = protectedCommandLine(command)
+
+# Unmount the second partion
+
+result = protectedCommandLine("umount /mnt 2>&1")
+
+# Delete the loop device associated with the root partition
+
+result = protectedCommandLine("losetup -d /dev/loop0 2>&1")
+
+print("\n{} should now bootable and will auto resize the root partition when the image file is next booted".format(sys.argv[1]))

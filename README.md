@@ -20,7 +20,7 @@ My workflow is usually something like this:
    - I copy it to another card
      + sudo dd bs=4M status=progress if=myRPI.img of=/dev/sdc
 
-Of course, myRPI.img is any file name and /dev/sdc must point to where your (unmounted) Rasbian image is.
+Of course, myRPI.img is any file name and /dev/sdc must point to where your (unmounted) Raspbian image is.
 
 **** Note ****
 This works only with Raspbian images (starting with buster) and the images are restricted to the following requirements:  a) there must only be two partions on the SD card (the first one FAT32 and the second Linux), b) you must not be using any loop devices prior to starting this utility, and c) you must have a mount point at /mnt and there must not be anything mounted to that mount point.

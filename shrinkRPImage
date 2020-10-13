@@ -426,4 +426,4 @@ result = protectedCommandLine("umount /mnt 2>&1")
 
 result = protectedCommandLine("losetup -d /dev/loop0 2>&1")
 
-print("\n{} should now bootable and will auto resize the root partition when the image file is next booted".format(sys.argv[1]))
+print("\n{} should now be bootable and will auto resize the root partition when the image file is next booted".format(sys.argv[1]))
